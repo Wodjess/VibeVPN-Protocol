@@ -6,7 +6,6 @@ variables:
   IMAGE_NAME: https-vpn-server
   CONTAINER_NAME: VPN
   VOLUME_NAME: vpn-data
-  SERVER_DIR: Server
 
 # ───────────────────────────────────────────────────────────
 # Validate: syntax check Python files
@@ -15,7 +14,6 @@ validate:
   stage: test
   image: python:3.12-slim
   script:
-    - cd $SERVER_DIR
     - python3 -m py_compile common.py
     - python3 -m py_compile tun_linux.py
     - python3 -m py_compile server.py
@@ -49,7 +47,7 @@ deploy_production:
     - apt-get update -qq && apt-get install -y -qq docker.io > /dev/null 2>&1
     - docker info > /dev/null 2>&1 || (echo "ERROR No access to Docker socket. Add /var/run/docker.sock to runner volumes in /etc/gitlab-runner/config.toml" && exit 1)
     - echo "=== Building Docker image ==="
-    - docker build -t $IMAGE_NAME $SERVER_DIR
+    - docker build -t $IMAGE_NAME .
     - docker rm -f $CONTAINER_NAME 2>/dev/null || true
     - echo "=== Starting VPN container ==="
     - |
