@@ -2,6 +2,7 @@
 """
 HTTPS VPN Server — runs inside Docker container.
 Supports multiple simultaneous clients with multi-queue TUN.
+Per-client send queues prevent one heavy client from starving others.
 """
 
 import asyncio
@@ -33,8 +34,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Number of TUN queues (parallel readers)
+# Suppress noisy websockets logs from port scanners/bots
+logging.getLogger("websockets").setLevel(logging.ERROR)
+
 NUM_TUN_QUEUES = int(os.environ.get("VPN_TUN_QUEUES", "4"))
+
+# Per-client send queue size: if full, oldest packets are dropped (not blocking)
+CLIENT_QUEUE_SIZE = 2048
 
 
 def configure_tun(tun_name: str, local_ip: str, mtu: int):
@@ -115,6 +121,54 @@ class IPPool:
             return len(self._allocated)
 
 
+class ClientSession:
+    """Per-client state: WebSocket + bounded send queue + sender task."""
+
+    def __init__(self, ws, username: str, client_ip: str):
+        self.ws = ws
+        self.username = username
+        self.client_ip = client_ip
+        self.queue = asyncio.Queue(maxsize=CLIENT_QUEUE_SIZE)
+        self.sender_task = asyncio.create_task(self._sender())
+
+    async def _sender(self):
+        """Drain the send queue → WebSocket. Runs as an independent task."""
+        try:
+            while True:
+                data = await self.queue.get()
+                if data is None:
+                    break  # poison pill
+                await self.ws.send(data)
+        except websockets.ConnectionClosed:
+            pass
+
+    def enqueue(self, data: bytes):
+        """Put packet into send queue. Drop oldest if full (never blocks)."""
+        try:
+            self.queue.put_nowait(data)
+        except asyncio.QueueFull:
+            # Drop oldest packet to make room
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self.queue.put_nowait(data)
+            except asyncio.QueueFull:
+                pass
+
+    async def stop(self):
+        """Stop the sender task cleanly."""
+        try:
+            self.queue.put_nowait(None)  # poison pill
+        except asyncio.QueueFull:
+            self.sender_task.cancel()
+        try:
+            await self.sender_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 class VPNServer:
     def __init__(self, cert: str, key: str, host: str, port: int):
         self.cert = cert
@@ -123,8 +177,9 @@ class VPNServer:
         self.port = port
         self.tun = MultiQueueTun("vpn0", NUM_TUN_QUEUES)
         self.ip_pool = IPPool()
-        self.clients: dict[str, websockets.WebSocketServerProtocol] = {}
-        self._write_queue = 0  # round-robin write queue
+        # Maps tunnel IP -> ClientSession
+        self.clients: dict[str, ClientSession] = {}
+        self._write_queue = 0
 
     async def start(self):
         self.tun.open()
@@ -137,8 +192,8 @@ class VPNServer:
         ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
 
         log.info(
-            "WSS server listening on %s:%d (%d TUN queues)",
-            self.host, self.port, NUM_TUN_QUEUES,
+            "WSS server listening on %s:%d (%d TUN queues, queue size %d)",
+            self.host, self.port, NUM_TUN_QUEUES, CLIENT_QUEUE_SIZE,
         )
         async with websockets.serve(
             self.handle_client,
@@ -149,7 +204,6 @@ class VPNServer:
             ping_interval=20,
             ping_timeout=60,
         ):
-            # Launch one reader per TUN queue
             readers = [
                 asyncio.create_task(self.tun_to_ws(q))
                 for q in range(NUM_TUN_QUEUES)
@@ -157,18 +211,16 @@ class VPNServer:
             await asyncio.gather(*readers)
 
     def _write_tun(self, data: bytes):
-        """Write packet to TUN, round-robin across queues."""
         q = self._write_queue
         self._write_queue = (q + 1) % NUM_TUN_QUEUES
         self.tun.write(data, queue=q)
 
     async def handle_client(self, ws):
-        # Auth: client sends "username:password"
+        # Authenticate
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
             credentials = raw.decode() if isinstance(raw, bytes) else raw
             if ":" not in credentials:
-                log.warning("Malformed auth from %s", ws.remote_address)
                 await ws.close(4001, "Unauthorized")
                 return
             username, password = credentials.split(":", 1)
@@ -180,15 +232,18 @@ class VPNServer:
             log.warning("Auth error: %s", e)
             return
 
-        ws_id = f"{ws.remote_address}"
-        client_ip = self.ip_pool.allocate(ws_id)
+        # Allocate IP
+        client_ip = self.ip_pool.allocate(f"{ws.remote_address}")
         if client_ip is None:
             log.warning("IP pool exhausted, rejecting %s", ws.remote_address)
             await ws.close(4002, "No IPs available")
             return
 
         await ws.send(client_ip.encode())
-        self.clients[client_ip] = ws
+
+        # Create per-client session with send queue
+        session = ClientSession(ws, username, client_ip)
+        self.clients[client_ip] = session
 
         log.info(
             "Client connected: %s [%s] -> %s (%d active)",
@@ -197,31 +252,16 @@ class VPNServer:
 
         try:
             async for message in ws:
-                if not isinstance(message, bytes) or len(message) == 0:
-                    continue
-                first_byte = message[0]
-                if (first_byte >> 4) in (4, 6):
-                    if len(message) >= 20:
-                        src_ip = get_src_ip(message)
-                        if src_ip == client_ip:
-                            self._write_tun(message)
-                else:
-                    offset = 0
-                    while offset + 2 <= len(message):
-                        pkt_len = int.from_bytes(message[offset:offset+2], "big")
-                        offset += 2
-                        if offset + pkt_len > len(message):
-                            break
-                        pkt = message[offset:offset+pkt_len]
-                        if len(pkt) >= 20:
-                            src_ip = get_src_ip(pkt)
-                            if src_ip == client_ip:
-                                self._write_tun(pkt)
-                        offset += pkt_len
+                if isinstance(message, bytes) and len(message) >= 20:
+                    src_ip = get_src_ip(message)
+                    if src_ip == client_ip:
+                        self._write_tun(message)
         except websockets.ConnectionClosed:
             pass
         finally:
-            if self.clients.get(client_ip) is ws:
+            # Stop sender task
+            await session.stop()
+            if self.clients.get(client_ip) is session:
                 del self.clients[client_ip]
             self.ip_pool.release(client_ip)
             log.info(
@@ -230,7 +270,7 @@ class VPNServer:
             )
 
     async def tun_to_ws(self, queue_id: int):
-        """Read packets from one TUN queue and dispatch to clients."""
+        """Read packets from one TUN queue and dispatch to client queues."""
         loop = asyncio.get_running_loop()
         while True:
             try:
@@ -251,12 +291,10 @@ class VPNServer:
                     and src_ip != SERVER_TUN_IP
                 ):
                     continue
-                ws = self.clients.get(dst_ip)
-                if ws is not None:
-                    try:
-                        asyncio.create_task(ws.send(data))
-                    except websockets.ConnectionClosed:
-                        pass
+                session = self.clients.get(dst_ip)
+                if session is not None:
+                    # Non-blocking enqueue — drops oldest if full
+                    session.enqueue(data)
             except OSError:
                 await asyncio.sleep(0.05)
 
