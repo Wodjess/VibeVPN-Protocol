@@ -55,33 +55,33 @@ fi
 
 # ── Print connection info ──────────────────────────────────────────────────
 VPN_PORT="${VPN_PORT:-443}"
-SECRET_MASKED="${VPN_SECRET:0:8}...${VPN_SECRET: -4}"
 
-echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║                    HTTPS VPN Server                         ║"
-echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║                                                             ║"
-echo "║  Status:    RUNNING                                         ║"
-echo "║                                                             ║"
-echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║  Connection settings for client:                            ║"
-echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║                                                             ║"
-printf "║  Server:    %-47s ║\n" "$EXTERNAL_IP"
-printf "║  Port:      %-47s ║\n" "$VPN_PORT"
-printf "║  Secret:    %-47s ║\n" "$SECRET_MASKED"
-echo "║                                                             ║"
-echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║  To get full secret:                                        ║"
-printf "║  docker exec %s cat /etc/vpn/.secret%-19s ║\n" "$HOSTNAME" ""
-echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║                                                             ║"
-printf "║  Max clients: %-44s ║\n" "253"
-printf "║  Tunnel subnet: %-41s ║\n" "10.8.0.0/24"
-printf "║  TLS cert: %-47s ║\n" "$CERT_FILE"
-echo "║                                                             ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
+# Helper: print a line padded to exact box width (60 inner chars)
+W=80
+line()  { printf "║  %-${W}s║\n" "$1"; }
+sep()   { printf "╠"; printf '═%.0s' $(seq 1 $((W+2))); printf "╣\n"; }
+empty() { printf "║  %-${W}s║\n" ""; }
+
+printf "╔"; printf '═%.0s' $(seq 1 $((W+2))); printf "╗\n"
+printf "║  %-${W}s║\n" "HTTPS VPN Server"
+sep
+empty
+line "Status:       RUNNING"
+empty
+sep
+line "Connection settings for client:"
+sep
+empty
+line "Server:       $EXTERNAL_IP"
+line "Port:         $VPN_PORT"
+line "Secret:       $VPN_SECRET"
+empty
+sep
+line "Max clients:  253"
+line "Subnet:       10.8.0.0/24"
+line "TLS cert:     $CERT_FILE"
+empty
+printf "╚"; printf '═%.0s' $(seq 1 $((W+2))); printf "╝\n"
 echo ""
 
 # ── Start the VPN server ───────────────────────────────────────────────────
