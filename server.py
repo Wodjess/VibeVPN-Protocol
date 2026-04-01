@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 HTTPS VPN Server — runs inside Docker container.
-Supports multiple simultaneous clients.
+Supports multiple simultaneous clients with multi-queue TUN.
 """
 
 import asyncio
@@ -26,7 +26,7 @@ from common import (
     get_src_ip,
     verify_auth_token,
 )
-from tun_linux import TunDevice
+from tun_linux import MultiQueueTun
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +34,9 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
+
+# Number of TUN queues (parallel readers)
+NUM_TUN_QUEUES = int(os.environ.get("VPN_TUN_QUEUES", "4"))
 
 
 def configure_tun(tun_name: str, local_ip: str, mtu: int):
@@ -47,14 +50,11 @@ def configure_tun(tun_name: str, local_ip: str, mtu: int):
 
 
 def enable_ip_forwarding():
-    """Enable IP forwarding. Falls back gracefully inside Docker
-    where --sysctl net.ipv4.ip_forward=1 is set at container start."""
     try:
         subprocess.run(
             ["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True, capture_output=True
         )
     except subprocess.CalledProcessError:
-        # Already enabled via Docker --sysctl flag
         pass
     log.info("IP forwarding enabled")
 
@@ -67,7 +67,6 @@ def setup_nat(tun_subnet: str):
     parts = result.stdout.split()
     iface = parts[parts.index("dev") + 1] if "dev" in parts else "eth0"
 
-    # Allow forwarding VPN traffic (Docker sets FORWARD policy to DROP)
     subprocess.run(
         ["iptables", "-A", "FORWARD", "-s", tun_subnet, "-o", iface, "-j", "ACCEPT"],
         check=True,
@@ -77,8 +76,6 @@ def setup_nat(tun_subnet: str):
          "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
         check=True,
     )
-
-    # NAT
     subprocess.run(
         [
             "iptables", "-t", "nat", "-A", "POSTROUTING",
@@ -150,11 +147,11 @@ class VPNServer:
         self.key = key
         self.host = host
         self.port = port
-        self.tun = TunDevice("vpn0")
+        self.tun = MultiQueueTun("vpn0", NUM_TUN_QUEUES)
         self.nonce_tracker = NonceTracker()
         self.ip_pool = IPPool()
         self.clients: dict[str, websockets.WebSocketServerProtocol] = {}
-        self._clients_lock = asyncio.Lock()
+        self._write_queue = 0  # round-robin write queue
 
     async def start(self):
         self.tun.open()
@@ -166,7 +163,10 @@ class VPNServer:
         ssl_ctx.load_cert_chain(self.cert, self.key)
         ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
 
-        log.info("WSS server listening on %s:%d", self.host, self.port)
+        log.info(
+            "WSS server listening on %s:%d (%d TUN queues)",
+            self.host, self.port, NUM_TUN_QUEUES,
+        )
         async with websockets.serve(
             self.handle_client,
             self.host,
@@ -176,7 +176,18 @@ class VPNServer:
             ping_interval=20,
             ping_timeout=60,
         ):
-            await self.tun_to_ws()
+            # Launch one reader per TUN queue
+            readers = [
+                asyncio.create_task(self.tun_to_ws(q))
+                for q in range(NUM_TUN_QUEUES)
+            ]
+            await asyncio.gather(*readers)
+
+    def _write_tun(self, data: bytes):
+        """Write packet to TUN, round-robin across queues."""
+        q = self._write_queue
+        self._write_queue = (q + 1) % NUM_TUN_QUEUES
+        self.tun.write(data, queue=q)
 
     async def handle_client(self, ws):
         try:
@@ -204,9 +215,7 @@ class VPNServer:
             return
 
         await ws.send(client_ip.encode())
-
-        async with self._clients_lock:
-            self.clients[client_ip] = ws
+        self.clients[client_ip] = ws
 
         log.info(
             "Client connected: %s -> %s (%d active)",
@@ -219,13 +228,11 @@ class VPNServer:
                     continue
                 first_byte = message[0]
                 if (first_byte >> 4) in (4, 6):
-                    # Single raw IP packet
                     if len(message) >= 20:
                         src_ip = get_src_ip(message)
                         if src_ip == client_ip:
-                            self.tun.write(message)
+                            self._write_tun(message)
                 else:
-                    # Batched: [2-byte len][packet]...
                     offset = 0
                     while offset + 2 <= len(message):
                         pkt_len = int.from_bytes(message[offset:offset+2], "big")
@@ -236,31 +243,34 @@ class VPNServer:
                         if len(pkt) >= 20:
                             src_ip = get_src_ip(pkt)
                             if src_ip == client_ip:
-                                self.tun.write(pkt)
+                                self._write_tun(pkt)
                         offset += pkt_len
         except websockets.ConnectionClosed:
             pass
         finally:
-            async with self._clients_lock:
-                if self.clients.get(client_ip) is ws:
-                    del self.clients[client_ip]
+            if self.clients.get(client_ip) is ws:
+                del self.clients[client_ip]
             self.ip_pool.release(client_ip)
             log.info(
                 "Client disconnected: %s (%s, %d active)",
                 ws.remote_address, client_ip, self.ip_pool.active_count,
             )
 
-    async def tun_to_ws(self):
+    async def tun_to_ws(self, queue_id: int):
+        """Read packets from one TUN queue and dispatch to clients."""
         loop = asyncio.get_running_loop()
         while True:
             try:
-                data = await loop.run_in_executor(None, self.tun.read, TUN_MTU + 100)
+                data = await loop.run_in_executor(
+                    None, self.tun.read, queue_id, TUN_MTU + 100
+                )
                 if not data or len(data) < 20:
                     continue
                 dst_ip = get_dst_ip(data)
                 src_ip = get_src_ip(data)
                 if dst_ip is None:
                     continue
+                # Block inter-client traffic
                 if (
                     src_ip and src_ip.startswith("10.8.0.")
                     and dst_ip.startswith("10.8.0.")
@@ -271,12 +281,11 @@ class VPNServer:
                 ws = self.clients.get(dst_ip)
                 if ws is not None:
                     try:
-                        # Fire-and-forget send — don't block TUN reader
                         asyncio.create_task(ws.send(data))
                     except websockets.ConnectionClosed:
                         pass
             except OSError:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
 
 
 def main():
