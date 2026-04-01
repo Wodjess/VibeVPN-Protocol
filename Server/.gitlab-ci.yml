@@ -1,0 +1,85 @@
+stages:
+  - test
+  - deploy
+
+variables:
+  IMAGE_NAME: https-vpn-server
+  CONTAINER_NAME: VPN
+  VOLUME_NAME: vpn-data
+
+# ───────────────────────────────────────────────────────────
+# Validate: syntax check Python files
+# ───────────────────────────────────────────────────────────
+validate:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - python3 -m py_compile common.py
+    - python3 -m py_compile tun_linux.py
+    - python3 -m py_compile server.py
+    - echo "All files OK"
+  only:
+    - merge_requests
+    - main
+
+# ───────────────────────────────────────────────────────────
+# Deploy: build image and run container via host Docker socket
+# ───────────────────────────────────────────────────────────
+# Prerequisites:
+#   1. GitLab Runner installed on the production server
+#   2. Runner config.toml has:
+#      [runners.docker]
+#        volumes = ["/var/run/docker.sock:/var/run/docker.sock"]
+#
+# CI/CD Variables (Settings → CI/CD → Variables):
+#   VPN_SECRET   — shared secret (masked, optional — auto-generated)
+#   VPN_HOST_IP  — server's public IP for client connection info
+#   VPN_PORT     — listening port (optional, default 443)
+#   VPN_DOMAIN   — domain for TLS cert (optional)
+# ───────────────────────────────────────────────────────────
+deploy_production:
+  stage: deploy
+  image: ruby:3.3
+  environment:
+    name: production
+  only:
+    - main
+  when: manual
+  script:
+    # Install Docker CLI to talk to host daemon via mounted socket
+    - apt-get update -qq && apt-get install -y -qq docker.io > /dev/null 2>&1
+
+    # Verify access to host Docker
+    - docker info > /dev/null 2>&1 || (echo "ERROR: No access to Docker socket. Add /var/run/docker.sock to runner volumes." && exit 1)
+
+    # Build image
+    - echo "=== Building Docker image ==="
+    - docker build -t $IMAGE_NAME .
+
+    # Stop old container (if exists)
+    - docker rm -f $CONTAINER_NAME 2>/dev/null || true
+
+    # Start new container
+    - echo "=== Starting VPN container ==="
+    - >
+      docker run -d
+      --name $CONTAINER_NAME
+      --restart unless-stopped
+      --cap-add NET_ADMIN
+      --device /dev/net/tun
+      --sysctl net.ipv4.ip_forward=1
+      -p ${VPN_PORT:-443}:${VPN_PORT:-443}
+      -v $VOLUME_NAME:/etc/vpn
+      --log-opt max-size=10m
+      --log-opt max-file=3
+      ${VPN_SECRET:+-e VPN_SECRET="$VPN_SECRET"}
+      ${VPN_DOMAIN:+-e VPN_DOMAIN="$VPN_DOMAIN"}
+      ${VPN_PORT:+-e VPN_PORT="$VPN_PORT"}
+      ${VPN_HOST_IP:+-e VPN_HOST_IP="$VPN_HOST_IP"}
+      $IMAGE_NAME
+
+    # Wait and show logs
+    - sleep 3
+    - echo "=== Container logs ==="
+    - docker logs $CONTAINER_NAME
+    - echo "=== Deploy complete ==="
