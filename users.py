@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """User management for HTTPS VPN server.
 
 Users are stored in /etc/vpn/users.json:
