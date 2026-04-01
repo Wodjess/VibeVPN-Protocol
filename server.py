@@ -50,7 +50,13 @@ def configure_tun(tun_name: str, local_ip: str, mtu: int):
     subprocess.run(
         ["ip", "link", "set", "dev", tun_name, "mtu", str(mtu), "up"], check=True
     )
-    log.info("TUN %s configured: %s/24", tun_name, local_ip)
+    # Fair queuing: fq_codel distributes bandwidth equally across flows (= clients)
+    # Prevents one heavy client from starving others
+    subprocess.run(
+        ["tc", "qdisc", "replace", "dev", tun_name, "root", "fq_codel"],
+        capture_output=True,
+    )
+    log.info("TUN %s configured: %s/24 (fq_codel)", tun_name, local_ip)
 
 
 def enable_ip_forwarding():
@@ -87,7 +93,12 @@ def setup_nat(tun_subnet: str):
         ],
         check=True,
     )
-    log.info("NAT configured: %s via %s (FORWARD + MASQUERADE)", tun_subnet, iface)
+    # Fair queuing on outgoing interface — equal bandwidth per flow
+    subprocess.run(
+        ["tc", "qdisc", "replace", "dev", iface, "root", "fq_codel"],
+        capture_output=True,
+    )
+    log.info("NAT configured: %s via %s (FORWARD + MASQUERADE + fq_codel)", tun_subnet, iface)
 
 
 class IPPool:
