@@ -5,6 +5,7 @@ Supports multiple simultaneous clients.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import signal
@@ -167,9 +168,12 @@ class VPNServer:
 
     async def handle_client(self, ws):
         try:
-            token = await asyncio.wait_for(ws.recv(), timeout=10)
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            token = raw.decode() if isinstance(raw, bytes) else raw
             if not verify_auth_token(token, self.secret):
-                log.warning("Auth failed from %s", ws.remote_address)
+                log.warning("Auth failed from %s (token=%s, secret_hash=%s)",
+                            ws.remote_address, token[:16] + "...",
+                            hashlib.sha256(self.secret.encode()).hexdigest()[:16])
                 await ws.close(4001, "Unauthorized")
                 return
             if not self.nonce_tracker.check_and_record(token):
@@ -245,7 +249,7 @@ class VPNServer:
 
 
 def main():
-    secret = os.environ.get("VPN_SECRET", "")
+    secret = os.environ.get("VPN_SECRET", "").strip()
     cert = os.environ.get("VPN_CERT", "/etc/vpn/cert.pem")
     key = os.environ.get("VPN_KEY", "/etc/vpn/key.pem")
     host = os.environ.get("VPN_HOST", "0.0.0.0")
