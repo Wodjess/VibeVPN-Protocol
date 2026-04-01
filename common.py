@@ -19,14 +19,25 @@ def derive_key(secret: str) -> bytes:
     return hashlib.sha256(secret.encode()).digest()
 
 
-def verify_auth_token(token: str, secret: str) -> bool:
+def verify_auth_token(token: str, secret: str, debug: bool = False) -> bool:
     """Verify an auth token."""
     try:
         nonce, sig = token.split(":")
         key = derive_key(secret)
         expected = hmac.new(key, nonce.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(sig, expected)
-    except (ValueError, AttributeError):
+        match = hmac.compare_digest(sig, expected)
+        if debug and not match:
+            import sys
+            print(f"[AUTH DEBUG] token type={type(token).__name__}, len={len(token)}", file=sys.stderr)
+            print(f"[AUTH DEBUG] nonce={nonce!r} ({len(nonce)} chars)", file=sys.stderr)
+            print(f"[AUTH DEBUG] sig={sig[:16]}... ({len(sig)} chars)", file=sys.stderr)
+            print(f"[AUTH DEBUG] expected={expected[:16]}... ({len(expected)} chars)", file=sys.stderr)
+            print(f"[AUTH DEBUG] secret={secret[:8]}...{secret[-4:]} ({len(secret)} chars)", file=sys.stderr)
+        return match
+    except (ValueError, AttributeError) as e:
+        if debug:
+            import sys
+            print(f"[AUTH DEBUG] parse error: {e}, token={token!r}", file=sys.stderr)
         return False
 
 

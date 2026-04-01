@@ -170,7 +170,7 @@ class VPNServer:
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
             token = raw.decode() if isinstance(raw, bytes) else raw
-            if not verify_auth_token(token, self.secret):
+            if not verify_auth_token(token, self.secret, debug=True):
                 log.warning("Auth failed from %s (token=%s, secret_hash=%s)",
                             ws.remote_address, token[:16] + "...",
                             hashlib.sha256(self.secret.encode()).hexdigest()[:16])
