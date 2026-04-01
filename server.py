@@ -67,6 +67,18 @@ def setup_nat(tun_subnet: str):
     parts = result.stdout.split()
     iface = parts[parts.index("dev") + 1] if "dev" in parts else "eth0"
 
+    # Allow forwarding VPN traffic (Docker sets FORWARD policy to DROP)
+    subprocess.run(
+        ["iptables", "-A", "FORWARD", "-s", tun_subnet, "-o", iface, "-j", "ACCEPT"],
+        check=True,
+    )
+    subprocess.run(
+        ["iptables", "-A", "FORWARD", "-d", tun_subnet, "-i", iface,
+         "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        check=True,
+    )
+
+    # NAT
     subprocess.run(
         [
             "iptables", "-t", "nat", "-A", "POSTROUTING",
@@ -74,7 +86,7 @@ def setup_nat(tun_subnet: str):
         ],
         check=True,
     )
-    log.info("NAT configured: %s via %s", tun_subnet, iface)
+    log.info("NAT configured: %s via %s (FORWARD + MASQUERADE)", tun_subnet, iface)
 
 
 class NonceTracker:
