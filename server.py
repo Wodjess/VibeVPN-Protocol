@@ -5,15 +5,12 @@ Supports multiple simultaneous clients with multi-queue TUN.
 """
 
 import asyncio
-import hashlib
 import logging
 import os
 import signal
 import ssl
 import subprocess
 import sys
-import threading
-import time
 
 import websockets
 
@@ -24,8 +21,8 @@ from common import (
     CLIENT_IP_END,
     get_dst_ip,
     get_src_ip,
-    verify_auth_token,
 )
+from users import authenticate
 from tun_linux import MultiQueueTun
 
 logging.basicConfig(
@@ -86,29 +83,6 @@ def setup_nat(tun_subnet: str):
     log.info("NAT configured: %s via %s (FORWARD + MASQUERADE)", tun_subnet, iface)
 
 
-class NonceTracker:
-    NONCE_EXPIRY = 300
-
-    def __init__(self):
-        self._used: dict[str, float] = {}
-        self._lock = threading.Lock()
-
-    def check_and_record(self, token: str) -> bool:
-        try:
-            nonce = token.split(":")[0]
-        except (ValueError, AttributeError):
-            return False
-        now = time.time()
-        with self._lock:
-            expired = [n for n, t in self._used.items() if now - t > self.NONCE_EXPIRY]
-            for n in expired:
-                del self._used[n]
-            if nonce in self._used:
-                return False
-            self._used[nonce] = now
-            return True
-
-
 class IPPool:
     def __init__(self):
         self._lock = threading.Lock()
@@ -141,14 +115,12 @@ class IPPool:
 
 
 class VPNServer:
-    def __init__(self, secret: str, cert: str, key: str, host: str, port: int):
-        self.secret = secret
+    def __init__(self, cert: str, key: str, host: str, port: int):
         self.cert = cert
         self.key = key
         self.host = host
         self.port = port
         self.tun = MultiQueueTun("vpn0", NUM_TUN_QUEUES)
-        self.nonce_tracker = NonceTracker()
         self.ip_pool = IPPool()
         self.clients: dict[str, websockets.WebSocketServerProtocol] = {}
         self._write_queue = 0  # round-robin write queue
@@ -190,18 +162,18 @@ class VPNServer:
         self.tun.write(data, queue=q)
 
     async def handle_client(self, ws):
+        # Auth: client sends "username:password"
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
-            token = raw.decode() if isinstance(raw, bytes) else raw
-            if not verify_auth_token(token, self.secret, debug=True):
-                log.warning("Auth failed from %s (token=%s, secret_hash=%s)",
-                            ws.remote_address, token[:16] + "...",
-                            hashlib.sha256(self.secret.encode()).hexdigest()[:16])
+            credentials = raw.decode() if isinstance(raw, bytes) else raw
+            if ":" not in credentials:
+                log.warning("Malformed auth from %s", ws.remote_address)
                 await ws.close(4001, "Unauthorized")
                 return
-            if not self.nonce_tracker.check_and_record(token):
-                log.warning("Replay attack detected from %s", ws.remote_address)
-                await ws.close(4003, "Replay detected")
+            username, password = credentials.split(":", 1)
+            if not authenticate(username, password):
+                log.warning("Auth failed for user '%s' from %s", username, ws.remote_address)
+                await ws.close(4001, "Unauthorized")
                 return
         except (asyncio.TimeoutError, websockets.ConnectionClosed, ValueError) as e:
             log.warning("Auth error: %s", e)
@@ -218,8 +190,8 @@ class VPNServer:
         self.clients[client_ip] = ws
 
         log.info(
-            "Client connected: %s -> %s (%d active)",
-            ws.remote_address, client_ip, self.ip_pool.active_count,
+            "Client connected: %s [%s] -> %s (%d active)",
+            username, ws.remote_address, client_ip, self.ip_pool.active_count,
         )
 
         try:
@@ -252,8 +224,8 @@ class VPNServer:
                 del self.clients[client_ip]
             self.ip_pool.release(client_ip)
             log.info(
-                "Client disconnected: %s (%s, %d active)",
-                ws.remote_address, client_ip, self.ip_pool.active_count,
+                "Client disconnected: %s [%s] (%s, %d active)",
+                username, ws.remote_address, client_ip, self.ip_pool.active_count,
             )
 
     async def tun_to_ws(self, queue_id: int):
@@ -289,17 +261,12 @@ class VPNServer:
 
 
 def main():
-    secret = os.environ.get("VPN_SECRET", "").strip()
     cert = os.environ.get("VPN_CERT", "/etc/vpn/cert.pem")
     key = os.environ.get("VPN_KEY", "/etc/vpn/key.pem")
     host = os.environ.get("VPN_HOST", "0.0.0.0")
     port = int(os.environ.get("VPN_PORT", "443"))
 
-    if not secret:
-        print("Error: VPN_SECRET environment variable is required", file=sys.stderr)
-        sys.exit(1)
-
-    server = VPNServer(secret, cert, key, host, port)
+    server = VPNServer(cert, key, host, port)
 
     loop = asyncio.new_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

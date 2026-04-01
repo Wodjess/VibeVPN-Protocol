@@ -17,6 +17,7 @@ validate:
     - python3 -m py_compile common.py
     - python3 -m py_compile tun_linux.py
     - python3 -m py_compile server.py
+    - python3 -m py_compile users.py
     - echo "All files OK"
   only:
     - merge_requests
@@ -61,7 +62,8 @@ deploy_production:
         -v $VOLUME_NAME:/etc/vpn \
         --log-opt max-size=10m \
         --log-opt max-file=3 \
-        ${VPN_SECRET:+-e VPN_SECRET="$VPN_SECRET"} \
+        ${VPN_ADMIN_USER:+-e VPN_ADMIN_USER="$VPN_ADMIN_USER"} \
+        ${VPN_ADMIN_PASS:+-e VPN_ADMIN_PASS="$VPN_ADMIN_PASS"} \
         ${VPN_DOMAIN:+-e VPN_DOMAIN="$VPN_DOMAIN"} \
         ${VPN_PORT:+-e VPN_PORT="$VPN_PORT"} \
         ${VPN_HOST_IP:+-e VPN_HOST_IP="$VPN_HOST_IP"} \
