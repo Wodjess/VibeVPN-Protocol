@@ -215,10 +215,29 @@ class VPNServer:
 
         try:
             async for message in ws:
-                if isinstance(message, bytes) and len(message) >= 20:
-                    src_ip = get_src_ip(message)
-                    if src_ip == client_ip:
-                        self.tun.write(message)
+                if not isinstance(message, bytes) or len(message) == 0:
+                    continue
+                first_byte = message[0]
+                if (first_byte >> 4) in (4, 6):
+                    # Single raw IP packet
+                    if len(message) >= 20:
+                        src_ip = get_src_ip(message)
+                        if src_ip == client_ip:
+                            self.tun.write(message)
+                else:
+                    # Batched: [2-byte len][packet]...
+                    offset = 0
+                    while offset + 2 <= len(message):
+                        pkt_len = int.from_bytes(message[offset:offset+2], "big")
+                        offset += 2
+                        if offset + pkt_len > len(message):
+                            break
+                        pkt = message[offset:offset+pkt_len]
+                        if len(pkt) >= 20:
+                            src_ip = get_src_ip(pkt)
+                            if src_ip == client_ip:
+                                self.tun.write(pkt)
+                        offset += pkt_len
         except websockets.ConnectionClosed:
             pass
         finally:
@@ -242,7 +261,6 @@ class VPNServer:
                 src_ip = get_src_ip(data)
                 if dst_ip is None:
                     continue
-                # Block inter-client traffic (both IPs in tunnel subnet)
                 if (
                     src_ip and src_ip.startswith("10.8.0.")
                     and dst_ip.startswith("10.8.0.")
@@ -253,7 +271,8 @@ class VPNServer:
                 ws = self.clients.get(dst_ip)
                 if ws is not None:
                     try:
-                        await ws.send(data)
+                        # Fire-and-forget send — don't block TUN reader
+                        asyncio.create_task(ws.send(data))
                     except websockets.ConnectionClosed:
                         pass
             except OSError:
