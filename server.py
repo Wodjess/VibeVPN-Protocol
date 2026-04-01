@@ -46,9 +46,15 @@ def configure_tun(tun_name: str, local_ip: str, mtu: int):
 
 
 def enable_ip_forwarding():
-    subprocess.run(
-        ["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True, capture_output=True
-    )
+    """Enable IP forwarding. Falls back gracefully inside Docker
+    where --sysctl net.ipv4.ip_forward=1 is set at container start."""
+    try:
+        subprocess.run(
+            ["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True, capture_output=True
+        )
+    except subprocess.CalledProcessError:
+        # Already enabled via Docker --sysctl flag
+        pass
     log.info("IP forwarding enabled")
 
 
