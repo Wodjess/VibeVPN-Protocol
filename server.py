@@ -38,9 +38,11 @@ log = logging.getLogger(__name__)
 logging.getLogger("websockets").setLevel(logging.ERROR)
 
 NUM_TUN_QUEUES = int(os.environ.get("VPN_TUN_QUEUES", "4"))
-
-# Per-client send queue size: if full, oldest packets are dropped (not blocking)
 CLIENT_QUEUE_SIZE = 2048
+
+# Allow clients to communicate with each other via VPN (LAN-like mode)
+# Set VPN_ALLOW_PEERS=0 to block inter-client traffic
+ALLOW_PEER_TRAFFIC = os.environ.get("VPN_ALLOW_PEERS", "1") in ("1", "true", "yes")
 
 
 def configure_tun(tun_name: str, local_ip: str, mtu: int):
@@ -69,6 +71,13 @@ def enable_ip_forwarding():
     log.info("IP forwarding enabled")
 
 
+def _iptables_ensure(rule: list[str]):
+    """Add iptables rule only if it doesn't already exist (idempotent)."""
+    check = [r if r != "-A" else "-C" for r in rule]
+    if subprocess.run(check, capture_output=True).returncode != 0:
+        subprocess.run(rule, check=True)
+
+
 def setup_nat(tun_subnet: str):
     result = subprocess.run(
         ["ip", "route", "show", "default"],
@@ -77,21 +86,16 @@ def setup_nat(tun_subnet: str):
     parts = result.stdout.split()
     iface = parts[parts.index("dev") + 1] if "dev" in parts else "eth0"
 
-    subprocess.run(
-        ["iptables", "-A", "FORWARD", "-s", tun_subnet, "-o", iface, "-j", "ACCEPT"],
-        check=True,
+    _iptables_ensure(
+        ["iptables", "-A", "FORWARD", "-s", tun_subnet, "-o", iface, "-j", "ACCEPT"]
     )
-    subprocess.run(
+    _iptables_ensure(
         ["iptables", "-A", "FORWARD", "-d", tun_subnet, "-i", iface,
-         "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
-        check=True,
+         "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"]
     )
-    subprocess.run(
-        [
-            "iptables", "-t", "nat", "-A", "POSTROUTING",
-            "-s", tun_subnet, "-o", iface, "-j", "MASQUERADE",
-        ],
-        check=True,
+    _iptables_ensure(
+        ["iptables", "-t", "nat", "-A", "POSTROUTING",
+         "-s", tun_subnet, "-o", iface, "-j", "MASQUERADE"]
     )
     # Fair queuing on outgoing interface — equal bandwidth per flow
     subprocess.run(
@@ -135,10 +139,11 @@ class IPPool:
 class ClientSession:
     """Per-client state: WebSocket + bounded send queue + sender task."""
 
-    def __init__(self, ws, username: str, client_ip: str):
+    def __init__(self, ws, username: str, client_ip: str, hostname: str = ""):
         self.ws = ws
         self.username = username
         self.client_ip = client_ip
+        self.hostname = hostname or username  # display name for peer list
         self.queue = asyncio.Queue(maxsize=CLIENT_QUEUE_SIZE)
         self.sender_task = asyncio.create_task(self._sender())
 
@@ -203,8 +208,9 @@ class VPNServer:
         ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
 
         log.info(
-            "WSS server listening on %s:%d (%d TUN queues, queue size %d)",
+            "WSS server listening on %s:%d (%d TUN queues, queue size %d, peers: %s)",
             self.host, self.port, NUM_TUN_QUEUES, CLIENT_QUEUE_SIZE,
+            "allowed" if ALLOW_PEER_TRAFFIC else "blocked",
         )
         async with websockets.serve(
             self.handle_client,
@@ -252,17 +258,34 @@ class VPNServer:
 
         await ws.send(client_ip.encode())
 
+        # Wait for client info (hostname) — text message sent right after IP assignment
+        hostname = username
+        try:
+            info = await asyncio.wait_for(ws.recv(), timeout=5)
+            if isinstance(info, str) and info.startswith("HOST:"):
+                hostname = info[5:].strip()[:64] or username
+        except (asyncio.TimeoutError, websockets.ConnectionClosed):
+            pass
+
         # Create per-client session with send queue
-        session = ClientSession(ws, username, client_ip)
+        session = ClientSession(ws, username, client_ip, hostname)
         self.clients[client_ip] = session
 
+        # Notify all peers about the new connection
+        self._broadcast_peer_update()
+
         log.info(
-            "Client connected: %s [%s] -> %s (%d active)",
-            username, ws.remote_address, client_ip, self.ip_pool.active_count,
+            "Client connected: %s (%s) [%s] -> %s (%d active)",
+            username, hostname, ws.remote_address, client_ip, self.ip_pool.active_count,
         )
 
         try:
             async for message in ws:
+                # Text messages = control commands
+                if isinstance(message, str):
+                    await self._handle_command(message, session)
+                    continue
+                # Binary messages = IP packets
                 if isinstance(message, bytes) and len(message) >= 20:
                     src_ip = get_src_ip(message)
                     if src_ip == client_ip:
@@ -270,15 +293,47 @@ class VPNServer:
         except websockets.ConnectionClosed:
             pass
         finally:
-            # Stop sender task
             await session.stop()
             if self.clients.get(client_ip) is session:
                 del self.clients[client_ip]
             self.ip_pool.release(client_ip)
+            self._broadcast_peer_update()
             log.info(
-                "Client disconnected: %s [%s] (%s, %d active)",
-                username, ws.remote_address, client_ip, self.ip_pool.active_count,
+                "Client disconnected: %s (%s) [%s] (%s, %d active)",
+                username, hostname, ws.remote_address, client_ip, self.ip_pool.active_count,
             )
+
+    def _get_peer_list(self) -> str:
+        """Build JSON peer list for all connected clients."""
+        import json
+        peers = [
+            {"username": s.username, "hostname": s.hostname, "ip": s.client_ip}
+            for s in self.clients.values()
+        ]
+        return "PEERS:" + json.dumps(peers)
+
+    def _broadcast_peer_update(self):
+        """Send updated peer list to all connected clients."""
+        msg = self._get_peer_list()
+        for session in list(self.clients.values()):
+            async def _send(ws, m):
+                try:
+                    await ws.send(m)
+                except websockets.ConnectionClosed:
+                    pass
+            asyncio.create_task(_send(session.ws, msg))
+
+    async def _handle_command(self, message: str, session: ClientSession):
+        """Handle text control commands from client."""
+        if message == "GET_PEERS":
+            try:
+                await session.ws.send(self._get_peer_list())
+            except websockets.ConnectionClosed:
+                pass
+        elif message.startswith("HOST:"):
+            # Late hostname update (arrived after timeout in handshake)
+            session.hostname = message[5:].strip()[:64] or session.username
+            self._broadcast_peer_update()
 
     async def tun_to_ws(self, queue_id: int):
         """Read packets from one TUN queue and dispatch to client queues."""
@@ -291,20 +346,20 @@ class VPNServer:
                 if not data or len(data) < 20:
                     continue
                 dst_ip = get_dst_ip(data)
-                src_ip = get_src_ip(data)
                 if dst_ip is None:
                     continue
-                # Block inter-client traffic
-                if (
-                    src_ip and src_ip.startswith("10.8.0.")
-                    and dst_ip.startswith("10.8.0.")
-                    and dst_ip != SERVER_TUN_IP
-                    and src_ip != SERVER_TUN_IP
-                ):
-                    continue
+                # Block inter-client traffic if disabled
+                if not ALLOW_PEER_TRAFFIC:
+                    src_ip = get_src_ip(data)
+                    if (
+                        src_ip and src_ip.startswith("10.8.0.")
+                        and dst_ip.startswith("10.8.0.")
+                        and dst_ip != SERVER_TUN_IP
+                        and src_ip != SERVER_TUN_IP
+                    ):
+                        continue
                 session = self.clients.get(dst_ip)
                 if session is not None:
-                    # Non-blocking enqueue — drops oldest if full
                     session.enqueue(data)
             except OSError:
                 await asyncio.sleep(0.05)

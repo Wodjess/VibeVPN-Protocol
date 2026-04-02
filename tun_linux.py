@@ -1,6 +1,7 @@
 """TUN interface for Linux (server side) with multi-queue support."""
 
 import os
+import select
 import struct
 import fcntl
 
@@ -65,14 +66,20 @@ class MultiQueueTun:
     def read(self, queue: int, bufsize: int = 65535) -> bytes:
         """Read from a specific queue. Blocks until a packet arrives."""
         fd = self.fds[queue]
-        # fd is O_NONBLOCK, use select to wait
-        import select
         select.select([fd], [], [])
         return os.read(fd, bufsize)
 
     def write(self, data: bytes, queue: int = 0) -> int:
-        """Write to a specific queue."""
-        return os.write(self.fds[queue], data)
+        """Write to a specific queue. Handles EAGAIN on non-blocking fd."""
+        fd = self.fds[queue]
+        try:
+            return os.write(fd, data)
+        except BlockingIOError:
+            # Buffer full — wait briefly and retry once
+            _, ready, _ = select.select([], [fd], [], 0.01)
+            if ready:
+                return os.write(fd, data)
+            return 0  # drop packet if still not ready
 
     def close(self):
         for fd in self.fds:

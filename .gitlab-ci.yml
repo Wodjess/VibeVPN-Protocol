@@ -67,6 +67,7 @@ deploy_production:
         ${VPN_DOMAIN:+-e VPN_DOMAIN="$VPN_DOMAIN"} \
         ${VPN_PORT:+-e VPN_PORT="$VPN_PORT"} \
         ${VPN_HOST_IP:+-e VPN_HOST_IP="$VPN_HOST_IP"} \
+        ${VPN_ALLOW_PEERS:+-e VPN_ALLOW_PEERS="$VPN_ALLOW_PEERS"} \
         $IMAGE_NAME
     - sleep 3
     - echo "=== Container logs ==="

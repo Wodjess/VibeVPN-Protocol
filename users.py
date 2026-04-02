@@ -20,18 +20,25 @@ USERS_FILE = os.environ.get("VPN_USERS_FILE", "/etc/vpn/users.json")
 
 
 def _hash_password(password: str) -> str:
-    """Hash password with SHA-256 + salt. Simple, no external deps."""
-    salt = secrets.token_hex(16)
-    h = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"{salt}:{h}"
+    """Hash password with scrypt (key-stretching, GPU-resistant)."""
+    salt = secrets.token_bytes(16)
+    h = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return f"scrypt:{salt.hex()}:{h.hex()}"
 
 
 def _verify_password(password: str, stored: str) -> bool:
-    """Verify password against stored salt:hash."""
+    """Verify password against stored hash. Supports scrypt and legacy SHA-256."""
     try:
-        salt, h = stored.split(":")
-        expected = hashlib.sha256((salt + password).encode()).hexdigest()
-        return secrets.compare_digest(h, expected)
+        if stored.startswith("scrypt:"):
+            _, salt_hex, h_hex = stored.split(":")
+            salt = bytes.fromhex(salt_hex)
+            expected = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+            return secrets.compare_digest(expected.hex(), h_hex)
+        else:
+            # Legacy SHA-256 format (salt:hash) — still verify, but new passwords use scrypt
+            salt, h = stored.split(":")
+            expected = hashlib.sha256((salt + password).encode()).hexdigest()
+            return secrets.compare_digest(h, expected)
     except (ValueError, AttributeError):
         return False
 
