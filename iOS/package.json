@@ -1,0 +1,23 @@
+{
+  "name": "VibeVPN",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "react-native start",
+    "ios": "react-native run-ios",
+    "build": "cd ios && xcodebuild -workspace VibeVPN.xcworkspace -scheme VibeVPN -configuration Release -sdk iphoneos -archivePath build/VibeVPN.xcarchive archive"
+  },
+  "dependencies": {
+    "react": "19.0.0",
+    "react-native": "0.79.2",
+    "@react-native-async-storage/async-storage": "^2.1.2"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.0",
+    "@babel/preset-env": "^7.25.0",
+    "@babel/runtime": "^7.25.0",
+    "@react-native/babel-preset": "^0.79.0",
+    "@react-native/metro-config": "^0.79.0",
+    "@react-native/typescript-config": "^0.79.0"
+  }
+}
