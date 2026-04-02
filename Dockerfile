@@ -6,6 +6,8 @@ RUN apt-get update && \
         iptables \
         openssl \
         procps \
+        certbot \
+        cron \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir websockets>=12.0

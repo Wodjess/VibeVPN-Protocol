@@ -59,12 +59,16 @@ deploy_production:
         --device /dev/net/tun \
         --sysctl net.ipv4.ip_forward=1 \
         -p ${VPN_PORT:-443}:${VPN_PORT:-443} \
+        -p 80:80 \
         -v $VOLUME_NAME:/etc/vpn \
+        -v vpn-letsencrypt:/etc/letsencrypt \
         --log-opt max-size=10m \
         --log-opt max-file=3 \
         ${VPN_ADMIN_USER:+-e VPN_ADMIN_USER="$VPN_ADMIN_USER"} \
         ${VPN_ADMIN_PASS:+-e VPN_ADMIN_PASS="$VPN_ADMIN_PASS"} \
         ${VPN_DOMAIN:+-e VPN_DOMAIN="$VPN_DOMAIN"} \
+        ${VPN_LETSENCRYPT:+-e VPN_LETSENCRYPT="$VPN_LETSENCRYPT"} \
+        ${VPN_EMAIL:+-e VPN_EMAIL="$VPN_EMAIL"} \
         ${VPN_PORT:+-e VPN_PORT="$VPN_PORT"} \
         ${VPN_HOST_IP:+-e VPN_HOST_IP="$VPN_HOST_IP"} \
         ${VPN_ALLOW_PEERS:+-e VPN_ALLOW_PEERS="$VPN_ALLOW_PEERS"} \

@@ -23,6 +23,8 @@ from common import (
     CLIENT_IP_END,
     get_dst_ip,
     get_src_ip,
+    is_tunnel_ip,
+    is_server_ip,
 )
 from users import authenticate
 from tun_linux import MultiQueueTun
@@ -345,19 +347,18 @@ class VPNServer:
                 )
                 if not data or len(data) < 20:
                     continue
-                dst_ip = get_dst_ip(data)
-                if dst_ip is None:
+                # IPv4 check (version nibble)
+                if (data[0] >> 4) != 4:
                     continue
-                # Block inter-client traffic if disabled
+                # Block inter-client traffic if disabled (fast bytes check)
                 if not ALLOW_PEER_TRAFFIC:
-                    src_ip = get_src_ip(data)
                     if (
-                        src_ip and src_ip.startswith("10.8.0.")
-                        and dst_ip.startswith("10.8.0.")
-                        and dst_ip != SERVER_TUN_IP
-                        and src_ip != SERVER_TUN_IP
+                        is_tunnel_ip(data, 12) and is_tunnel_ip(data, 16)
+                        and not is_server_ip(data, 12) and not is_server_ip(data, 16)
                     ):
                         continue
+                # Extract dst IP string for client lookup
+                dst_ip = f"{data[16]}.{data[17]}.{data[18]}.{data[19]}"
                 session = self.clients.get(dst_ip)
                 if session is not None:
                     session.enqueue(data)
