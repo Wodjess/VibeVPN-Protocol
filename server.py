@@ -308,10 +308,11 @@ class VPNServer:
             pass
         finally:
             await session.stop()
+            # Only release IP if this session still owns it (not kicked by a newer session)
             if self.clients.get(client_ip) is session:
                 del self.clients[client_ip]
-            self.ip_pool.release(client_ip)
-            self._broadcast_peer_update()
+                self.ip_pool.release(client_ip)
+                self._broadcast_peer_update()
             log.info(
                 "Client disconnected: %s (%s) [%s] (%s, %d active)",
                 username, hostname, ws.remote_address, client_ip, self.ip_pool.active_count,
