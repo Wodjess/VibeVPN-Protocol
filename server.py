@@ -271,6 +271,16 @@ class VPNServer:
         except (asyncio.TimeoutError, websockets.ConnectionClosed):
             pass
 
+        # Disconnect any existing sessions for this username (one user = one connection)
+        for old_ip, old_session in list(self.clients.items()):
+            if old_session.username == username:
+                log.info("Kicking old session for %s (%s)", username, old_ip)
+                await old_session.stop()
+                try: await old_session.ws.close(4003, "New session")
+                except Exception: pass
+                del self.clients[old_ip]
+                self.ip_pool.release(old_ip)
+
         # Create per-client session with send queue
         session = ClientSession(ws, username, client_ip, hostname)
         self.clients[client_ip] = session
