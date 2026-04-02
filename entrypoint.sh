@@ -11,7 +11,8 @@ VPN_PORT="${VPN_PORT:-443}"
 if [ ! -f "$USERS_FILE" ] || [ "$(cat "$USERS_FILE" 2>/dev/null)" = "{}" ]; then
     DEFAULT_USER="${VPN_ADMIN_USER:-admin}"
     DEFAULT_PASS="${VPN_ADMIN_PASS:-$(openssl rand -hex 8)}"
-    python3 /app/users.py add "$DEFAULT_USER" "$DEFAULT_PASS"
+    # Pass password via env to avoid leaking in /proc/cmdline or ps
+    VPN_STDIN_PASS="$DEFAULT_PASS" python3 /app/users.py add-stdin "$DEFAULT_USER"
     echo "[INIT] Created default user: $DEFAULT_USER / $DEFAULT_PASS"
     echo "$DEFAULT_PASS" > "$CERT_DIR/.admin_pass"
     chmod 600 "$CERT_DIR/.admin_pass"

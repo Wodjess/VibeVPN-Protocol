@@ -6,6 +6,8 @@ Per-client send queues prevent one heavy client from starving others.
 """
 
 import asyncio
+import collections
+import json
 import logging
 import os
 import signal
@@ -13,6 +15,8 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import websockets
 
@@ -21,8 +25,6 @@ from common import (
     TUN_MTU,
     CLIENT_IP_START,
     CLIENT_IP_END,
-    get_dst_ip,
-    get_src_ip,
     is_tunnel_ip,
     is_server_ip,
 )
@@ -47,6 +49,41 @@ CLIENT_QUEUE_SIZE = 2048
 # Allow clients to communicate with each other via VPN (LAN-like mode)
 # Set VPN_ALLOW_PEERS=0 to block inter-client traffic
 ALLOW_PEER_TRAFFIC = os.environ.get("VPN_ALLOW_PEERS", "1") in ("1", "true", "yes")
+
+# Auth rate-limiting: max attempts per IP within the time window
+AUTH_MAX_ATTEMPTS = int(os.environ.get("VPN_AUTH_MAX_ATTEMPTS", "5"))
+AUTH_WINDOW_SECONDS = int(os.environ.get("VPN_AUTH_WINDOW", "60"))
+
+# TLS certificate reload interval (seconds)
+TLS_RELOAD_INTERVAL = int(os.environ.get("VPN_TLS_RELOAD_INTERVAL", "3600"))
+
+
+class AuthRateLimiter:
+    """Sliding-window rate limiter for authentication attempts per IP."""
+
+    def __init__(self, max_attempts: int = AUTH_MAX_ATTEMPTS, window: int = AUTH_WINDOW_SECONDS):
+        self.max_attempts = max_attempts
+        self.window = window
+        self._attempts: dict[str, collections.deque] = {}
+
+    def is_blocked(self, ip: str) -> bool:
+        now = time.monotonic()
+        dq = self._attempts.get(ip)
+        if dq is None:
+            return False
+        # Evict expired entries
+        while dq and dq[0] <= now - self.window:
+            dq.popleft()
+        if not dq:
+            del self._attempts[ip]
+            return False
+        return len(dq) >= self.max_attempts
+
+    def record(self, ip: str):
+        now = time.monotonic()
+        if ip not in self._attempts:
+            self._attempts[ip] = collections.deque()
+        self._attempts[ip].append(now)
 
 
 def configure_tun(tun_name: str, local_ip: str, mtu: int):
@@ -141,7 +178,11 @@ class IPPool:
 
 
 class ClientSession:
-    """Per-client state: WebSocket + bounded send queue + sender task."""
+    """Per-client state: WebSocket + bounded send queue + sender task.
+
+    Uses two queues: priority (control messages) and data (IP packets).
+    The sender drains priority first, ensuring control messages are never dropped.
+    """
 
     def __init__(self, ws, username: str, client_ip: str, hostname: str = ""):
         self.ws = ws
@@ -149,25 +190,41 @@ class ClientSession:
         self.client_ip = client_ip
         self.hostname = hostname or username  # display name for peer list
         self.queue = asyncio.Queue(maxsize=CLIENT_QUEUE_SIZE)
+        self._priority_queue = asyncio.Queue(maxsize=64)
+        self._has_data = asyncio.Event()
         self.sender_task = asyncio.create_task(self._sender())
 
     async def _sender(self):
-        """Drain the send queue → WebSocket. Runs as an independent task."""
+        """Drain priority queue first, then data queue → WebSocket."""
         try:
             while True:
-                data = await self.queue.get()
-                if data is None:
-                    break  # poison pill
-                await self.ws.send(data)
+                # Drain all priority messages first
+                while not self._priority_queue.empty():
+                    msg = self._priority_queue.get_nowait()
+                    if msg is None:
+                        return
+                    await self.ws.send(msg)
+                # Then one data packet
+                try:
+                    data = self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    data = None
+                if data is not None:
+                    await self.ws.send(data)
+                else:
+                    # Wait for something to appear in either queue
+                    self._has_data.clear()
+                    # Check again before waiting (avoid race)
+                    if self._priority_queue.empty() and self.queue.empty():
+                        await self._has_data.wait()
         except websockets.ConnectionClosed:
             pass
 
     def enqueue(self, data: bytes):
-        """Put packet into send queue. Drop oldest if full (never blocks)."""
+        """Put packet into data send queue. Drop oldest if full (never blocks)."""
         try:
             self.queue.put_nowait(data)
         except asyncio.QueueFull:
-            # Drop oldest packet to make room
             try:
                 self.queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -176,11 +233,21 @@ class ClientSession:
                 self.queue.put_nowait(data)
             except asyncio.QueueFull:
                 pass
+        self._has_data.set()
+
+    def enqueue_control(self, message: str):
+        """Put control message into priority queue (never dropped)."""
+        try:
+            self._priority_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            pass  # 64 control messages backed up — extremely unlikely
+        self._has_data.set()
 
     async def stop(self):
         """Stop the sender task cleanly."""
         try:
-            self.queue.put_nowait(None)  # poison pill
+            self._priority_queue.put_nowait(None)  # poison pill via priority
+            self._has_data.set()
         except asyncio.QueueFull:
             self.sender_task.cancel()
         try:
@@ -197,9 +264,37 @@ class VPNServer:
         self.port = port
         self.tun = MultiQueueTun("vpn0", NUM_TUN_QUEUES)
         self.ip_pool = IPPool()
-        # Maps tunnel IP -> ClientSession
-        self.clients: dict[str, ClientSession] = {}
+        # Maps tunnel IP (bytes, 4 octets) -> ClientSession for fast packet routing
+        self.clients: dict[bytes, ClientSession] = {}
         self._write_queue = 0
+        self._rate_limiter = AuthRateLimiter()
+        self._tun_executor = ThreadPoolExecutor(
+            max_workers=NUM_TUN_QUEUES, thread_name_prefix="tun-reader"
+        )
+        self._shutdown_event = asyncio.Event()
+
+    def _make_ssl_context(self) -> ssl.SSLContext:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(self.cert, self.key)
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        return ssl_ctx
+
+    async def _tls_reload_loop(self, ssl_ctx: ssl.SSLContext):
+        """Periodically reload TLS certificate from disk."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=TLS_RELOAD_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                pass
+            if self._shutdown_event.is_set():
+                break
+            try:
+                ssl_ctx.load_cert_chain(self.cert, self.key)
+                log.info("TLS certificate reloaded")
+            except Exception as e:
+                log.warning("TLS certificate reload failed: %s", e)
 
     async def start(self):
         self.tun.open()
@@ -207,9 +302,7 @@ class VPNServer:
         enable_ip_forwarding()
         setup_nat("10.8.0.0/24")
 
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.load_cert_chain(self.cert, self.key)
-        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ssl_ctx = self._make_ssl_context()
 
         log.info(
             "WSS server listening on %s:%d (%d TUN queues, queue size %d, peers: %s)",
@@ -224,29 +317,71 @@ class VPNServer:
             max_size=2 ** 16,
             ping_interval=20,
             ping_timeout=60,
-        ):
+        ) as ws_server:
+            self._ws_server = ws_server
             readers = [
                 asyncio.create_task(self.tun_to_ws(q))
                 for q in range(NUM_TUN_QUEUES)
             ]
-            await asyncio.gather(*readers)
+            tls_task = asyncio.create_task(self._tls_reload_loop(ssl_ctx))
+            try:
+                await self._shutdown_event.wait()
+            finally:
+                tls_task.cancel()
+                for r in readers:
+                    r.cancel()
+                # Graceful disconnect: close all client sessions
+                for session in list(self.clients.values()):
+                    await session.stop()
+                    try:
+                        await session.ws.close(1001, "Server shutting down")
+                    except Exception:
+                        pass
+                self.clients.clear()
+                log.info("All clients disconnected")
 
     def _write_tun(self, data: bytes):
+        # Round-robin across TUN queues (safe: called only from asyncio event loop)
         q = self._write_queue
         self._write_queue = (q + 1) % NUM_TUN_QUEUES
         self.tun.write(data, queue=q)
 
+    @staticmethod
+    def _ip_str_to_bytes(ip: str) -> bytes:
+        parts = ip.split(".")
+        return bytes(int(p) for p in parts)
+
+    def _get_remote_ip(self, ws) -> str:
+        """Extract remote IP as string from WebSocket."""
+        addr = ws.remote_address
+        if isinstance(addr, tuple):
+            return addr[0]
+        return str(addr)
+
     async def handle_client(self, ws):
+        remote_ip = self._get_remote_ip(ws)
+
+        # Rate-limit check before any auth work
+        if self._rate_limiter.is_blocked(remote_ip):
+            log.warning("Rate-limited auth from %s", remote_ip)
+            await ws.close(4001, "Too many attempts")
+            return
+
         # Authenticate
         try:
             raw = await asyncio.wait_for(ws.recv(), timeout=10)
             credentials = raw.decode() if isinstance(raw, bytes) else raw
             if ":" not in credentials:
+                self._rate_limiter.record(remote_ip)
                 await ws.close(4001, "Unauthorized")
                 return
             username, password = credentials.split(":", 1)
-            if not authenticate(username, password):
-                log.warning("Auth failed for user '%s' from %s", username, ws.remote_address)
+            # Run scrypt in executor to avoid blocking event loop
+            loop = asyncio.get_running_loop()
+            auth_ok = await loop.run_in_executor(None, authenticate, username, password)
+            if not auth_ok:
+                self._rate_limiter.record(remote_ip)
+                log.warning("Auth failed for user '%s' from %s", username, remote_ip)
                 await ws.close(4001, "Unauthorized")
                 return
         except (asyncio.TimeoutError, websockets.ConnectionClosed, ValueError) as e:
@@ -254,12 +389,13 @@ class VPNServer:
             return
 
         # Allocate IP
-        client_ip = self.ip_pool.allocate(f"{ws.remote_address}")
+        client_ip = self.ip_pool.allocate(remote_ip)
         if client_ip is None:
-            log.warning("IP pool exhausted, rejecting %s", ws.remote_address)
+            log.warning("IP pool exhausted, rejecting %s", remote_ip)
             await ws.close(4002, "No IPs available")
             return
 
+        client_ip_bytes = self._ip_str_to_bytes(client_ip)
         await ws.send(client_ip.encode())
 
         # Wait for client info (hostname) — text message sent right after IP assignment
@@ -272,25 +408,27 @@ class VPNServer:
             pass
 
         # Disconnect any existing sessions for this username (one user = one connection)
-        for old_ip, old_session in list(self.clients.items()):
+        for old_ip_bytes, old_session in list(self.clients.items()):
             if old_session.username == username:
-                log.info("Kicking old session for %s (%s)", username, old_ip)
+                log.info("Kicking old session for %s (%s)", username, old_session.client_ip)
                 await old_session.stop()
-                try: await old_session.ws.close(4003, "New session")
-                except Exception: pass
-                del self.clients[old_ip]
-                self.ip_pool.release(old_ip)
+                try:
+                    await old_session.ws.close(4003, "New session")
+                except Exception:
+                    pass
+                del self.clients[old_ip_bytes]
+                self.ip_pool.release(old_session.client_ip)
 
         # Create per-client session with send queue
         session = ClientSession(ws, username, client_ip, hostname)
-        self.clients[client_ip] = session
+        self.clients[client_ip_bytes] = session
 
         # Notify all peers about the new connection
         self._broadcast_peer_update()
 
         log.info(
             "Client connected: %s (%s) [%s] -> %s (%d active)",
-            username, hostname, ws.remote_address, client_ip, self.ip_pool.active_count,
+            username, hostname, remote_ip, client_ip, self.ip_pool.active_count,
         )
 
         try:
@@ -301,26 +439,25 @@ class VPNServer:
                     continue
                 # Binary messages = IP packets
                 if isinstance(message, bytes) and len(message) >= 20:
-                    src_ip = get_src_ip(message)
-                    if src_ip == client_ip:
+                    # Fast src IP check: compare raw bytes at offset 12-16
+                    if message[12:16] == client_ip_bytes:
                         self._write_tun(message)
         except websockets.ConnectionClosed:
             pass
         finally:
             await session.stop()
             # Only release IP if this session still owns it (not kicked by a newer session)
-            if self.clients.get(client_ip) is session:
-                del self.clients[client_ip]
+            if self.clients.get(client_ip_bytes) is session:
+                del self.clients[client_ip_bytes]
                 self.ip_pool.release(client_ip)
                 self._broadcast_peer_update()
             log.info(
                 "Client disconnected: %s (%s) [%s] (%s, %d active)",
-                username, hostname, ws.remote_address, client_ip, self.ip_pool.active_count,
+                username, hostname, remote_ip, client_ip, self.ip_pool.active_count,
             )
 
     def _get_peer_list(self) -> str:
         """Build JSON peer list for all connected clients."""
-        import json
         peers = [
             {"username": s.username, "hostname": s.hostname, "ip": s.client_ip}
             for s in self.clients.values()
@@ -328,23 +465,15 @@ class VPNServer:
         return "PEERS:" + json.dumps(peers)
 
     def _broadcast_peer_update(self):
-        """Send updated peer list to all connected clients."""
+        """Send updated peer list to all connected clients via priority queue."""
         msg = self._get_peer_list()
         for session in list(self.clients.values()):
-            async def _send(ws, m):
-                try:
-                    await ws.send(m)
-                except websockets.ConnectionClosed:
-                    pass
-            asyncio.create_task(_send(session.ws, msg))
+            session.enqueue_control(msg)
 
     async def _handle_command(self, message: str, session: ClientSession):
         """Handle text control commands from client."""
         if message == "GET_PEERS":
-            try:
-                await session.ws.send(self._get_peer_list())
-            except websockets.ConnectionClosed:
-                pass
+            session.enqueue_control(self._get_peer_list())
         elif message.startswith("HOST:"):
             # Late hostname update (arrived after timeout in handshake)
             session.hostname = message[5:].strip()[:64] or session.username
@@ -356,7 +485,7 @@ class VPNServer:
         while True:
             try:
                 data = await loop.run_in_executor(
-                    None, self.tun.read, queue_id, TUN_MTU + 100
+                    self._tun_executor, self.tun.read, queue_id, TUN_MTU + 100
                 )
                 if not data or len(data) < 20:
                     continue
@@ -370,9 +499,9 @@ class VPNServer:
                         and not is_server_ip(data, 12) and not is_server_ip(data, 16)
                     ):
                         continue
-                # Extract dst IP string for client lookup
-                dst_ip = f"{data[16]}.{data[17]}.{data[18]}.{data[19]}"
-                session = self.clients.get(dst_ip)
+                # Lookup by raw dst IP bytes (4 octets) — no string allocation
+                dst_key = data[16:20]
+                session = self.clients.get(dst_key)
                 if session is not None:
                     session.enqueue(data)
             except OSError:
@@ -389,13 +518,14 @@ def main():
 
     loop = asyncio.new_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: loop.stop())
+        loop.add_signal_handler(sig, server._shutdown_event.set)
 
     try:
         loop.run_until_complete(server.start())
     except KeyboardInterrupt:
         pass
     finally:
+        server._tun_executor.shutdown(wait=False)
         server.tun.close()
         log.info("Server stopped")
 
