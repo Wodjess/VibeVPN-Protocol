@@ -37,7 +37,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Suppress noisy websockets logs from port scanners/bots
-logging.getLogger("websockets").setLevel(logging.ERROR)
+logging.getLogger("websockets").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.asyncio.server").setLevel(logging.CRITICAL)
 
 NUM_TUN_QUEUES = int(os.environ.get("VPN_TUN_QUEUES", "4"))
 CLIENT_QUEUE_SIZE = 2048
