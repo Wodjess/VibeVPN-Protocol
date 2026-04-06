@@ -1,0 +1,9 @@
+{
+  "name": "vibevpn-cli",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "koffi": "^2.15.2",
+    "ws": "^8.20.0"
+  }
+}

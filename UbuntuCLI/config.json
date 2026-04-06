@@ -1,0 +1,8 @@
+{
+  "server": "YOUR_SERVER_IP",
+  "port": 443,
+  "username": "YOUR_USERNAME",
+  "password": "YOUR_PASSWORD",
+  "allowSelfSigned": true,
+  "hostname": "MY_COMPUTER"
+}

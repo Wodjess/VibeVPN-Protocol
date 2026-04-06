@@ -2,12 +2,17 @@ const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } = require
 const path = require('node:path');
 const net = require('node:net');
 const { spawn, spawnSync, execSync } = require('node:child_process');
-const { existsSync, writeFileSync, copyFileSync, mkdirSync, chmodSync } = require('node:fs');
+const { existsSync, writeFileSync, readFileSync, copyFileSync, mkdirSync, chmodSync } = require('node:fs');
 
 if (require('electron-squirrel-startup')) app.quit();
 
 const IS_WIN = process.platform === 'win32';
 const IS_MAC = process.platform === 'darwin';
+
+// Fix black screen on Windows VMs / outdated GPU drivers
+if (IS_WIN) {
+  app.disableHardwareAcceleration();
+}
 
 // Single instance
 const gotLock = app.requestSingleInstanceLock();
@@ -15,6 +20,29 @@ if (!gotLock) { app.quit(); process.exit(0); }
 
 let mainWindow = null;
 let tray = null;
+
+// Windows: use integrated Node.js VPN module (no separate service)
+let vpnWin = null;
+let vpnWinTask = null;
+if (IS_WIN) {
+  try { vpnWin = require('./vpn-win'); }
+  catch (err) { console.error('[VibeVPN] Failed to load vpn-win:', err); }
+}
+
+// ── Last-connected server persistence (for auto-reconnect on boot) ───
+const LAST_SERVER_FILE = path.join(app.getPath('userData'), 'last-server.json');
+
+function saveLastServer(opts) {
+  try { writeFileSync(LAST_SERVER_FILE, JSON.stringify(opts)); } catch {}
+}
+
+function loadLastServer() {
+  try { return JSON.parse(readFileSync(LAST_SERVER_FILE, 'utf8')); } catch { return null; }
+}
+
+function clearLastServer() {
+  try { if (existsSync(LAST_SERVER_FILE)) writeFileSync(LAST_SERVER_FILE, ''); } catch {}
+}
 
 // Paths
 const HELPER_DEST = '/Library/PrivilegedHelperTools/com.vibevpn.helper';
@@ -143,7 +171,9 @@ function createWindow() {
   });
 
   mainWindow.loadURL(MAIN_WINDOW_WEBPACK_ENTRY);
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.once('ready-to-show', () => {
+    if (!process.argv.includes('--hidden')) mainWindow.show();
+  });
 
   mainWindow.on('close', (e) => {
     if (!app.isQuitting) {
@@ -236,11 +266,22 @@ app.whenReady().then(async () => {
   }
 
   createTray();
+  createWindow(); // always create window (shown or hidden based on --hidden flag)
+  if (process.argv.includes('--hidden') && IS_MAC) app.dock.hide();
 
-  if (process.argv.includes('--hidden')) {
-    if (IS_MAC) app.dock.hide();
-  } else {
-    createWindow();
+  // Auto-reconnect on boot (Windows only, when launched with --hidden)
+  if (IS_WIN && process.argv.includes('--hidden') && vpnWin) {
+    const last = loadLastServer();
+    if (last && last.server && last.username && last.password) {
+      console.log('[VibeVPN] Auto-reconnecting to', last.server);
+      vpnWinTask = vpnWin.vpnConnect({
+        server: last.server,
+        port: last.port || 443,
+        username: last.username,
+        password: last.password,
+      });
+      vpnWinTask.finally(() => { vpnWinTask = null; });
+    }
   }
 });
 
@@ -253,46 +294,60 @@ app.on('activate', () => createWindow());
 app.on('window-all-closed', () => {}); // stay in tray
 app.on('before-quit', () => { app.isQuitting = true; });
 
-// Autostart
-const firstRunKey = path.join(app.getPath('userData'), '.autostart-set');
-if (!existsSync(firstRunKey)) {
+// Autostart via Windows Task Scheduler (runs elevated without UAC prompt)
+const autostartPathFile = path.join(app.getPath('userData'), '.autostart-path');
+if (IS_WIN) {
+  app.whenReady().then(() => {
+    const exePath = process.execPath;
+    const taskName = 'VibeVPN';
+    // Check if task needs to be created or updated (new install or exe moved)
+    const savedPath = existsSync(autostartPathFile)
+      ? readFileSync(autostartPathFile, 'utf8').trim()
+      : null;
+    if (savedPath === exePath) return; // already registered with correct path
+
+    try {
+      app.setLoginItemSettings({ openAtLogin: false }); // clean up old method
+      execSync(
+        `schtasks /Create /F /SC ONLOGON /TN "${taskName}" /TR "\\"${exePath}\\" --hidden" /RL HIGHEST`,
+        { windowsHide: true }
+      );
+      writeFileSync(autostartPathFile, exePath);
+    } catch (err) {
+      console.error('[VibeVPN] Failed to create autostart task:', err.message);
+    }
+  });
+} else if (!existsSync(autostartPathFile)) {
   app.whenReady().then(() => {
     app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true, args: ['--hidden'] });
-    writeFileSync(firstRunKey, '1');
+    writeFileSync(autostartPathFile, process.execPath);
   });
 }
 
 // ── IPC ───────────────────────────────────────────────────────────────
 
-// Windows: use integrated Node.js VPN module (no separate service)
-let vpnWin = null;
-if (IS_WIN) {
-  try { vpnWin = require('./vpn-win'); }
-  catch (err) { console.error('[VibeVPN] Failed to load vpn-win:', err); }
-}
-let vpnWinTask = null;
-
 if (IS_WIN) {
   // Windows: direct calls to vpn-win.js
   ipcMain.handle('vpn:connect', async (_, { server, port, username, password }) => {
     try {
+      // If already connected/running, disconnect first (server switch)
       const st = vpnWin.vpnStatus();
-      if (st.connected) return { ok: true, ip: st.assigned_ip };
-
-      // Prevent double-connect: if already running, return current error or wait
-      if (vpnWinTask) {
-        return { error: st.error || 'Connection already in progress' };
+      if (st.connected || vpnWinTask) {
+        try { await vpnWin.vpnDisconnect(); } catch {}
+        if (vpnWinTask) { try { await vpnWinTask; } catch {} vpnWinTask = null; }
       }
 
       vpnWinTask = vpnWin.vpnConnect({ server, port: port || 443, username, password });
-      // Clean up task reference when done
       vpnWinTask.finally(() => { vpnWinTask = null; });
 
       // Poll for connection
       for (let i = 0; i < 30; i++) {
         await new Promise(r => setTimeout(r, 500));
         const s = vpnWin.vpnStatus();
-        if (s.connected) return { ok: true, ip: s.assigned_ip };
+        if (s.connected) {
+          saveLastServer({ server, port: port || 443, username, password });
+          return { ok: true, ip: s.assigned_ip };
+        }
         if (s.error) return { error: s.error };
       }
       return { error: 'Connection timeout' };
@@ -302,6 +357,7 @@ if (IS_WIN) {
   });
 
   ipcMain.handle('vpn:disconnect', async () => {
+    clearLastServer();
     try { await vpnWin.vpnDisconnect(); } catch {}
     if (vpnWinTask) { try { await vpnWinTask; } catch {} vpnWinTask = null; }
     return { ok: true };

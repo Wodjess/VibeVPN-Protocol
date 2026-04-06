@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import ConnectionPanel from './ConnectionPanel.jsx';
 import ServerList from './ServerList.jsx';
 import AddServerModal from './AddServerModal.jsx';
@@ -30,42 +30,54 @@ export default function App() {
 
   const selected = servers.find((s) => s.id === selectedId) || null;
 
-  // Realtime status sync from helper (1s polling via main process)
+  // Refs to avoid stale closures in the status callback
+  const serversRef = useRef(servers);
+  const connectedServerIdRef = useRef(connectedServerId);
+  const statusRef = useRef(status);
+  useEffect(() => { serversRef.current = servers; }, [servers]);
+  useEffect(() => { connectedServerIdRef.current = connectedServerId; }, [connectedServerId]);
+  useEffect(() => { statusRef.current = status; }, [status]);
+
+  // Realtime status sync from helper (1s polling via main process).
+  // Runs once — reads changing values via refs.
   useEffect(() => {
     const offStatus = window.vpn.onStatusUpdate((st) => {
-      // Always update logs and peers
       if (st.logs && st.logs.length > 0) setLogs(st.logs);
       if (st.peers) setPeers(st.peers);
 
       if (st.connected) {
         setStatus('connected');
         setLocalIp(st.assigned_ip || null);
-        const match = servers.find((s) => s.host === st.server) || servers[0];
-        if (match && connectedServerId !== match.id) {
+        const srvs = serversRef.current;
+        const match = srvs.find((s) => s.host === st.server) || srvs[0];
+        if (match && connectedServerIdRef.current !== match.id) {
           setSelectedId(match.id);
           setConnectedServerId(match.id);
         }
-      } else if (status === 'connected' || status === 'connecting') {
+      } else if (statusRef.current === 'connected') {
+        // Only transition connected→disconnected via polling.
+        // Don't override 'connecting' state — handleConnect manages that.
         setStatus('disconnected');
         setConnectedServerId(null);
         setLocalIp(null);
       }
     });
 
-    // Also check once immediately on mount
+    // Check once on mount
     window.vpn.status().then((st) => {
       if (st.connected) {
         setStatus('connected');
         setLocalIp(st.assigned_ip || null);
         if (st.peers) setPeers(st.peers);
         if (st.logs) setLogs(st.logs);
-        const match = servers.find((s) => s.host === st.server) || servers[0];
+        const srvs = serversRef.current;
+        const match = srvs.find((s) => s.host === st.server) || srvs[0];
         if (match) { setSelectedId(match.id); setConnectedServerId(match.id); }
       }
     }).catch(() => {});
 
     return () => offStatus();
-  }, [servers]);
+  }, []);
 
   // Listen for peer list pushes
   useEffect(() => {
@@ -99,13 +111,16 @@ export default function App() {
   const handleConnect = useCallback(async () => {
     if (!selected) return;
 
-    if (status === 'connected' || status === 'connecting') {
+    // If connected to the same server — disconnect
+    if ((status === 'connected' || status === 'connecting') && connectedServerId === selectedId) {
       setStatus('disconnected');
       setConnectedServerId(null);
+      setLocalIp(null);
       try { await window.vpn.disconnect(); } catch {}
       return;
     }
 
+    // Connect (or switch server — main process handles disconnect automatically)
     setStatus('connecting');
     setLogs([]);
     setPeers([]);
@@ -134,7 +149,7 @@ export default function App() {
       setStatus('disconnected');
       setLogs((prev) => [...prev, `Error: ${err.message || err}`]);
     }
-  }, [selected, status]);
+  }, [selected, status, connectedServerId, selectedId]);
 
   return (
     <div className="app">

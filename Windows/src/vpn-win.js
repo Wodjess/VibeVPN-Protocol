@@ -23,6 +23,13 @@ function log(...args) {
   if (_logs.length > 100) _logs.shift();
 }
 
+// Reconnect backoff
+const BACKOFF_BASE = 3;
+const BACKOFF_MAX = 60;
+
+// Connection lock — prevents concurrent connect/disconnect
+let _connLock = Promise.resolve();
+
 // ── State ────────────────────────────────────────────────────────────────
 
 const state = {
@@ -168,11 +175,13 @@ function getDefaultGateway() {
       { windowsHide: true, timeout: 15000, encoding: 'utf8' }
     );
     const gw = out.trim();
+    if (!gw || !isValidIp(gw)) {
+      throw new Error(`Invalid gateway: ${gw}`);
+    }
     log('Default gateway:', gw);
-    return gw || '192.168.1.1';
+    return gw;
   } catch (e) {
-    log('Failed to get gateway:', e.message);
-    return '192.168.1.1';
+    throw new Error(`Cannot determine default gateway: ${e.message}`);
   }
 }
 
@@ -247,21 +256,22 @@ async function vpnConnect({ server, port, username, password }) {
 
   log('Connecting to', server, ':', state.port);
 
-  try {
-    serverIp = await resolveHost(server);
-    log('Resolved', server, '->', serverIp);
-  } catch (e) {
-    state.error = `DNS failed: ${e.message}`;
-    state.running = false;
-    return;
-  }
-
-  const gateway = getDefaultGateway();
-  const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(server);
+  const isIp = isValidIp(server);
+  let gateway = null;
   let tunConfigured = false;
+  let backoff = BACKOFF_BASE;
 
   while (state.running) {
     try {
+      // Resolve inside loop so DNS/network failures are retried
+      if (!serverIp) {
+        serverIp = await resolveHost(server);
+        log('Resolved', server, '->', serverIp);
+      }
+      if (!gateway) {
+        gateway = getDefaultGateway();
+      }
+
       const wsUrl = `wss://${server}:${state.port}`;
       const wsOpts = isIp ? { rejectUnauthorized: false } : {};
 
@@ -288,6 +298,7 @@ async function vpnConnect({ server, port, username, password }) {
       state.assignedIp = assignedIp;
       state.connected = true;
       state.error = null;
+      backoff = BACKOFF_BASE; // Reset on success
 
       // Send hostname
       const os = require('node:os');
@@ -296,16 +307,17 @@ async function vpnConnect({ server, port, username, password }) {
       log('Authenticated, assigned IP:', state.assignedIp);
 
       // Set up WS message handler EARLY (before TUN setup) so we don't miss PEERS broadcast
-      state._ws.on('message', (msg) => {
-        if (typeof msg === 'string') {
+      state._ws.on('message', (data, isBinary) => {
+        if (!isBinary) {
+          const msg = data.toString();
           if (msg.startsWith('PEERS:')) {
             try { state.peers = JSON.parse(msg.slice(6)); } catch {}
           }
           return;
         }
         // Binary data = IP packet -> write to TUN
-        if (msg && msg.length > 0 && tunSession) {
-          const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
+        if (data && data.length > 0 && tunSession) {
+          const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
           tunWrite(buf);
           tunPktsRecv++;
         }
@@ -373,18 +385,20 @@ async function vpnConnect({ server, port, username, password }) {
       if (!state.running) break;
       state.connected = false;
       state.error = e.message;
-      log('Connection lost:', e.message, '- reconnecting in 3s...');
+      log(`Connection lost: ${e.message} - reconnecting in ${backoff}s...`);
       if (state._readInterval) { clearInterval(state._readInterval); state._readInterval = null; }
-      await new Promise(r => setTimeout(r, 3000));
+      await new Promise(r => setTimeout(r, backoff * 1000));
+      backoff = Math.min(backoff * 2, BACKOFF_MAX);
     }
   }
 
-  // Cleanup
+  // Cleanup — each step in its own try/catch so failures don't cascade
   state.connected = false;
   if (state._readInterval) { clearInterval(state._readInterval); state._readInterval = null; }
-  teardownRoutes(serverIp);
-  tunClose();
-  restoreDns();
+  try { teardownRoutes(serverIp); } catch (e) { log('Failed to teardown routes:', e.message); }
+  try { tunClose(); } catch (e) { log('Failed to close TUN:', e.message); }
+  try { restoreDns(); } catch (e) { log('Failed to restore DNS:', e.message); }
+  serverIp = null;
   log('Disconnected, cleanup done');
 }
 

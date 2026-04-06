@@ -10,14 +10,22 @@ export default function AddServerModal({ onAdd, onClose }) {
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (!host.trim()) { setError('Server IP is required'); return; }
+    const h = host.trim();
+    if (!h) { setError('Server address is required'); return; }
+    if (h.length > 255) { setError('Server address is too long'); return; }
     if (!username.trim()) { setError('Login is required'); return; }
     if (!password.trim()) { setError('Password is required'); return; }
 
+    const portNum = parseInt(port, 10);
+    if (!portNum || portNum < 1 || portNum > 65535) {
+      setError('Port must be between 1 and 65535');
+      return;
+    }
+
     onAdd({
-      name: name.trim() || host.trim(),
-      host: host.trim(),
-      port: parseInt(port, 10) || 443,
+      name: name.trim() || h,
+      host: h,
+      port: portNum,
       username: username.trim(),
       password: password.trim(),
     });

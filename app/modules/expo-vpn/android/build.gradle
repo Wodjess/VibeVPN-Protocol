@@ -1,0 +1,23 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.vpn'
+version = '0.1.0'
+
+android {
+  namespace "expo.modules.vpn"
+  defaultConfig {
+    versionCode 1
+    versionName "0.1.0"
+    minSdkVersion 24
+  }
+  lintOptions {
+    abortOnError false
+  }
+}
+
+dependencies {
+  implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+}

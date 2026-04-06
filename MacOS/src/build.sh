@@ -4,14 +4,14 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLIENT_DIR="$(dirname "$SCRIPT_DIR")"
-ELECTRON_DIR="$CLIENT_DIR/vibevpn"
+ELECTRON_DIR="$CLIENT_DIR/electron"
 
 echo "=== VibeVPN macOS Build ==="
 
 # ── Find Python ───────────────────────────────────────────────────────
 PYTHON=""
-for p in "$CLIENT_DIR/.venv/bin/python3" "$CLIENT_DIR/../.venv/bin/python3" \
-         "$HOME/Documents/.venv/bin/python3" "python3"; do
+for p in "$SCRIPT_DIR/.venv/bin/python3" "$CLIENT_DIR/.venv/bin/python3" \
+         "$CLIENT_DIR/../.venv/bin/python3" "$HOME/Documents/.venv/bin/python3" "python3"; do
     if command -v "$p" &>/dev/null && "$p" -c "import websockets" 2>/dev/null; then
         PYTHON="$p"; break
     fi
@@ -24,8 +24,8 @@ echo "[2/3] Building vpn-helper..."
 cd "$SCRIPT_DIR"
 "$PYTHON" -m PyInstaller --onefile --name vpn-helper \
     --hidden-import websockets --hidden-import tun_darwin --hidden-import common \
-    --add-data "$CLIENT_DIR/common.py:." \
-    --add-data "$CLIENT_DIR/tun_darwin.py:." \
+    --add-data "$SCRIPT_DIR/common.py:." \
+    --add-data "$SCRIPT_DIR/tun_darwin.py:." \
     --clean --noconfirm \
     vpn-helper.py 2>&1 | tail -3
 

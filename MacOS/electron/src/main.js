@@ -1,8 +1,9 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } = require('electron');
 const path = require('node:path');
 const net = require('node:net');
-const { spawn, spawnSync, execSync } = require('node:child_process');
-const { existsSync, writeFileSync, copyFileSync, mkdirSync, chmodSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const { existsSync, readFileSync, writeFileSync } = require('node:fs');
+const { createHash } = require('node:crypto');
 
 if (require('electron-squirrel-startup')) app.quit();
 
@@ -25,19 +26,20 @@ const HELPER_TCP_PORT = 19876;
 
 // ── Helper install (macOS) — runs once on first launch ────────────────
 
+function fileHash(filepath) {
+  return createHash('sha256').update(readFileSync(filepath)).digest('hex');
+}
+
 function isHelperInstalled() {
   if (!IS_MAC) return true;
   if (!existsSync(HELPER_BIN) || !existsSync(PLIST_DEST)) return false;
 
-  // Check if bundled helper is newer than installed one
+  // Verify installed binary matches bundled one via SHA-256 hash
   const srcBin = app.isPackaged
     ? path.join(process.resourcesPath, 'vpn-helper')
     : path.resolve(__dirname, '..', '..', '..', 'MacOS', 'dist', 'vpn-helper');
   if (existsSync(srcBin)) {
-    const { statSync } = require('node:fs');
-    const installed = statSync(HELPER_BIN).size;
-    const bundled = statSync(srcBin).size;
-    if (installed !== bundled) return false;  // needs update
+    if (fileHash(HELPER_BIN) !== fileHash(srcBin)) return false;
   }
   return true;
 }
@@ -53,8 +55,12 @@ function isHelperRunning() {
   } catch { return false; }
 }
 
+function shellEscape(s) {
+  // Escape for single-quoted shell strings: only ' needs escaping
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
 function installHelper() {
-  // vpn-helper binary is bundled in Resources/
   const srcBin = app.isPackaged
     ? path.join(process.resourcesPath, 'vpn-helper')
     : path.resolve(__dirname, '..', '..', '..', 'MacOS', 'dist', 'vpn-helper');
@@ -67,22 +73,23 @@ function installHelper() {
     return false;
   }
 
-  // Build install script
-  const script = `
-    mkdir -p '${HELPER_DEST}' && \
-    cp '${srcBin}' '${HELPER_BIN}' && \
-    chmod 755 '${HELPER_BIN}' && \
-    cp '${srcPlist}' '${PLIST_DEST}' && \
-    launchctl unload '${PLIST_DEST}' 2>/dev/null; \
-    launchctl load -w '${PLIST_DEST}'
-  `.trim().replace(/\n\s+/g, ' ');
+  // Build install script with properly escaped paths
+  const script = [
+    `mkdir -p ${shellEscape(HELPER_DEST)}`,
+    `cp ${shellEscape(srcBin)} ${shellEscape(HELPER_BIN)}`,
+    `chmod 755 ${shellEscape(HELPER_BIN)}`,
+    `cp ${shellEscape(srcPlist)} ${shellEscape(PLIST_DEST)}`,
+    `launchctl unload ${shellEscape(PLIST_DEST)} 2>/dev/null; launchctl load -w ${shellEscape(PLIST_DEST)}`,
+  ].join(' && ');
 
   try {
-    // Native macOS password dialog via osascript
-    execSync(
-      `osascript -e 'do shell script "${script.replace(/"/g, '\\"')}" with administrator privileges'`,
-      { timeout: 60000 }
-    );
+    // Use spawnSync to avoid outer shell interpolation;
+    // only the inner AppleScript string needs escaping
+    const appleScript = `do shell script "${script.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}" with administrator privileges`;
+    const result = spawnSync('osascript', ['-e', appleScript], {
+      timeout: 60000, encoding: 'utf-8',
+    });
+    if (result.status !== 0) throw new Error(result.stderr || 'Install failed');
     return true;
   } catch (err) {
     dialog.showErrorBox('VibeVPN', 'Failed to install helper. Administrator access is required.');
@@ -92,13 +99,13 @@ function installHelper() {
 
 // ── Communication with helper (macOS) ─────────────────────────────────
 
-function sendToHelper(cmd) {
+function sendToHelper(cmd, timeout = 10000) {
   return new Promise((resolve, reject) => {
     const client = IS_MAC
       ? net.createConnection({ path: HELPER_UNIX })
       : net.createConnection({ host: '127.0.0.1', port: HELPER_TCP_PORT });
 
-    client.setTimeout(10000);
+    client.setTimeout(timeout);
     let buf = Buffer.alloc(0);
 
     client.on('connect', () => {
@@ -120,7 +127,7 @@ function sendToHelper(cmd) {
       }
     });
 
-    client.on('error', reject);
+    client.on('error', (err) => { client.destroy(); reject(err); });
     client.on('timeout', () => { client.destroy(); reject(new Error('Timeout')); });
   });
 }
@@ -323,12 +330,10 @@ if (IS_WIN) {
   // macOS: communicate with helper over Unix socket (unchanged)
   ipcMain.handle('vpn:connect', async (_, { server, port, username, password }) => {
     try {
-      const current = await sendToHelper({ action: 'status' });
-      if (current.connected) return { ok: true, ip: current.assigned_ip };
-
+      // Helper handles disconnect-if-needed automatically (server switch)
       const result = await sendToHelper({
         action: 'connect', server, port: port || 443, username, password,
-      });
+      }, 30000);
       if (result.connected) return { ok: true, ip: result.assigned_ip };
 
       for (let i = 0; i < 30; i++) {
