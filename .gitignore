@@ -1,1 +1,17 @@
 node_modules/
+
+# Electron build artifacts (forge + webpack + electron-builder output)
+**/.webpack/
+**/out/
+**/build/
+**/dist/
+*.dll
+*.node
+*.so
+*.dylib
+Windows/build.zip
+MacOS/build.zip
+MacOS/VibeDMG
+
+# Local Claude Code config (per-user, never tracked)
+.claude/settings.local.json
