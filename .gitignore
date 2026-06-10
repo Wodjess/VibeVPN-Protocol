@@ -1,17 +1,22 @@
 node_modules/
+__pycache__/
 
 # Electron build artifacts (forge + webpack + electron-builder output)
 **/.webpack/
 **/out/
 **/build/
 **/dist/
-*.dll
+# Native Node.js addons (not wintun.dll — wintun is a required runtime dep, do NOT ignore)
 *.node
 *.so
 *.dylib
+# Pre-built installer/binary archives
 Windows/build.zip
 MacOS/build.zip
 MacOS/VibeDMG
+# PyInstaller intermediate artifacts (keep MacOS/src/build.sh and *.spec — those are source)
+MacOS/src/build/
+MacOS/src/dist/
 
 # Local Claude Code config (per-user, never tracked)
 .claude/settings.local.json
